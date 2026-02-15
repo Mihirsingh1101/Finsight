@@ -1,64 +1,59 @@
+# slm_interpreter.py
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-# ==========================================
-# CONFIG
-# ==========================================
-
 MODEL_ID = "Mihirsingh1101/smolified-finsight-ratio-interpreter"
 
-_tokenizer = None
-_model = None
-_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = None
+model = None
 
 
-# ==========================================
-# LOAD MODEL (SAFE + STABLE)
-# ==========================================
-
+# ---------------------------
+# LOAD MODEL (LOCAL ONLY)
+# ---------------------------
 def load_model():
-    global _tokenizer, _model
+    global tokenizer, model
 
-    if _tokenizer is None or _model is None:
-        print("🔹 Loading FinSight SLM...")
+    if tokenizer is None or model is None:
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_ID,
+            local_files_only=True
+        )
 
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            local_files_only=True
+        )
 
-        # 🔥 IMPORTANT: No FP16, No device_map auto
-        _model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+        model.eval()
 
-        _model.to(_device)
-        _model.eval()
+        # FORCE CPU (avoid CUDA crash)
+        model.to("cpu")
 
         print("✅ Model loaded successfully.")
 
-    return _tokenizer, _model
+    return tokenizer, model
 
 
-# ==========================================
+# ---------------------------
 # SYSTEM PROMPT
-# ==========================================
-
+# ---------------------------
 SYSTEM_PROMPT = """
-You are FinSight SLM, a professional financial diagnostic AI.
+You are FinSight SLM.
 
-The user provides financial ratios for a category.
-
-You must:
-• Provide one-line interpretation per ratio.
-• Provide a concise 2–3 line category summary.
-• Adapt tone based on severity.
-• Avoid repetition.
-• Do NOT calculate.
-• Do NOT generate tables.
-• Keep output structured and professional.
+Provide:
+- One-line interpretation per ratio.
+- Then a concise 2-3 line summary.
+- No calculations.
+- No tables.
+- Professional tone.
 """
 
 
-# ==========================================
+# ---------------------------
 # BUILD PROMPT
-# ==========================================
-
+# ---------------------------
 def build_prompt(category_name, ratios_dict):
 
     ratios_text = ""
@@ -72,16 +67,15 @@ Category: {category_name}
 """
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT.strip()},
-        {"role": "user", "content": user_prompt.strip()}
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt}
     ]
 
 
-# ==========================================
-# GENERATE RESPONSE (CUDA SAFE)
-# ==========================================
-
-def generate_response(messages):
+# ---------------------------
+# GENERATE + FORCE STRUCTURE
+# ---------------------------
+def generate_response(messages, ratios_dict):
 
     tokenizer, model = load_model()
 
@@ -91,24 +85,48 @@ def generate_response(messages):
         add_generation_prompt=True
     )
 
-    if text.startswith("<bos>"):
-        text = text.replace("<bos>", "")
-
-    inputs = tokenizer(
-        text,
-        return_tensors="pt"
-    ).to(_device)
+    inputs = tokenizer(text, return_tensors="pt")
 
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_new_tokens=300,
-            do_sample=False,     # 🔥 NO SAMPLING (CUDA SAFE)
+            max_new_tokens=200,
+            temperature=0.2,
+            do_sample=False
         )
 
     decoded = tokenizer.decode(output[0], skip_special_tokens=True)
 
-    # Remove prompt from output safely
-    cleaned_output = decoded.replace(text, "").strip()
+    # Remove prompt echo
+    raw_output = decoded.split("assistant")[-1].strip()
 
-    return cleaned_output
+    # -----------------------------------
+    # FORCE STRUCTURE (VERY IMPORTANT)
+    # -----------------------------------
+    sentences = raw_output.split(". ")
+
+    structured_lines = []
+    summary_lines = []
+
+    ratio_keys = list(ratios_dict.keys())
+
+    # Assign first N sentences to ratios
+    for i, ratio in enumerate(ratio_keys):
+        if i < len(sentences):
+            line = sentences[i].strip()
+            structured_lines.append(f"{ratio}: {line}.")
+        else:
+            structured_lines.append(f"{ratio}: Interpretation unavailable.")
+
+    # Remaining sentences → summary
+    remaining = sentences[len(ratio_keys):]
+    if remaining:
+        summary = ". ".join(remaining).strip()
+        summary_lines.append(summary)
+
+    final_output = "\n".join(structured_lines)
+
+    if summary_lines:
+        final_output += "\n\nSummary:\n" + "\n".join(summary_lines)
+
+    return final_output
